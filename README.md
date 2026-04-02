@@ -164,7 +164,7 @@ cp .env.example .env
 
 If Ollama runs on a different machine, update `OLLAMA_HOST` in `.env`:
 ```
-OLLAMA_HOST=http://192.168.1.100:11434
+OLLAMA_HOST=http://your_ip_address:11434
 ```
 
 ### Run
