@@ -1,98 +1,178 @@
 """
-DeskPod - Module 1: Animated Robot Eyes
-Standalone test: python3 main.py
-Keyboard controls:
+DeskBot - Main Orchestrator
+
+Entry point for DeskBot. Creates the event bus, initializes all modules,
+and runs the Qt GUI event loop alongside the asyncio event loop.
+
+The tricky part here: Qt has its own event loop (app.exec()) and we need
+asyncio for the event bus and module coroutines. We solve this by running
+asyncio in a background thread and using Qt's event loop as the main loop.
+Qt signals/slots are thread-safe, so the FaceModule can safely call
+eye_controller.set_state() from the asyncio thread.
+
+Usage:
+    python3 main.py              # windowed 1080x1080 (development)
+    python3 main.py --fullscreen # fullscreen (Raspberry Pi deployment)
+
+Keyboard controls (for testing, handled in QML):
     I = Idle, L = Listening, T = Thinking, S = Speaking
     H = Happy, C = Confused, Z = Sleeping, Esc/Q = Quit
 """
 
 import sys
-import os
+import asyncio
+import threading
+import logging
+import argparse
 from pathlib import Path
 
-from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot, pyqtProperty, QUrl
+from PyQt6.QtCore import QUrl
 from PyQt6.QtGui import QColor, QGuiApplication
 from PyQt6.QtQuick import QQuickView
-from PyQt6.QtQml import QQmlContext
+
+from event_bus import EventBus
+from face_module import EyeController, FaceModule
+
+# ─── Logging Setup ───
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+    datefmt="%H:%M:%S"
+)
+logger = logging.getLogger("deskbot.main")
 
 
-class EyeController(QObject):
+def run_async_loop(loop: asyncio.AbstractEventLoop, bus: EventBus, modules: list):
     """
-    Controls eye state from Python side.
-    
-    This is the bridge between the future audio/LLM pipeline and the QML
-    eye rendering. Right now we drive it from keyboard input for testing.
-    Later, other modules will call set_state() directly.
-    
-    States:
-        idle      - default, random blinks and subtle movement
-        listening - eyes widen, pupils dilate, attentive look
-        thinking  - eyes squint, look up-right, pupils shrink
-        speaking  - engaged look, subtle movement synced to output
-        happy     - curved lower eyelids (anime smile)
-        confused  - asymmetric eyes, one eyebrow raised
-        sleeping  - eyes closed, gentle breathing animation
+    Run the asyncio event loop in a background thread.
+
+    This function:
+        1. Sets up all modules (calls setup() on each)
+        2. Starts all modules as concurrent tasks
+        3. Runs until the loop is stopped (when Qt quits)
     """
+    asyncio.set_event_loop(loop)
 
-    stateChanged = pyqtSignal(str)
+    async def run_modules():
+        # Setup all modules
+        for module in modules:
+            await module.setup()
+            logger.info(f"Module '{module.name}' setup complete")
 
-    def __init__(self):
-        super().__init__()
-        self._state = "idle"
+        # Start all modules concurrently
+        tasks = [asyncio.create_task(module.start()) for module in modules]
+        logger.info(f"All {len(tasks)} modules started")
 
-    @pyqtProperty(str, notify=stateChanged)
-    def state(self):
-        return self._state
+        # Wait for all tasks (they run until cancelled)
+        try:
+            await asyncio.gather(*tasks)
+        except asyncio.CancelledError:
+            logger.info("Modules cancelled, shutting down")
 
-    @pyqtSlot(str)
-    def set_state(self, new_state):
-        valid_states = {
-            "idle", "listening", "thinking",
-            "speaking", "happy", "confused", "sleeping"
-        }
-        if new_state in valid_states and new_state != self._state:
-            self._state = new_state
-            self.stateChanged.emit(self._state)
-            print(f"[EyeController] State -> {self._state}")
+    try:
+        loop.run_until_complete(run_modules())
+    except RuntimeError as e:
+        if "Event loop stopped" in str(e):
+            pass  # Expected during shutdown
+        else:
+            logger.error(f"Async loop error: {e}", exc_info=True)
+    except Exception as e:
+        logger.error(f"Async loop error: {e}", exc_info=True)
 
 
 def main():
+    parser = argparse.ArgumentParser(description="DeskBot - Desk Companion Robot")
+    parser.add_argument("--fullscreen", action="store_true",
+                        help="Run fullscreen (for Raspberry Pi deployment)")
+    args = parser.parse_args()
+
+    # ─── Qt Application ───
+
     app = QGuiApplication(sys.argv)
 
-    # Create the eye controller (Python -> QML bridge)
-    controller = EyeController()
+    # ─── Event Bus ───
 
-    # Load QML
+    bus = EventBus()
+
+    # ─── Eye Controller (Qt/QML bridge) ───
+
+    eye_controller = EyeController()
+
+    # ─── Modules ───
+
+    face_module = FaceModule(bus, eye_controller)
+
+    # Future modules will be added here:
+    # tts_module = TTSModule(bus)
+    # stt_module = STTModule(bus)
+    # llm_module = LLMModule(bus)
+    # wake_module = WakeWordModule(bus)
+    # camera_module = CameraModule(bus)
+
+    all_modules = [face_module]
+
+    # ─── Start Async Loop in Background Thread ───
+
+    async_loop = asyncio.new_event_loop()
+    async_thread = threading.Thread(
+        target=run_async_loop,
+        args=(async_loop, bus, all_modules),
+        daemon=True  # Dies when main thread exits
+    )
+    async_thread.start()
+
+    # ─── Load QML ───
+
     view = QQuickView()
-    view.setTitle("DeskPod Eyes")
+    view.setTitle("DeskBot")
 
-    # Expose controller to QML as 'eyeController'
-    view.rootContext().setContextProperty("eyeController", controller)
+    # Connect QML Qt.quit() to app shutdown
+    view.engine().quit.connect(app.quit)
 
-    # Load QML file from same directory as this script
+    # Expose eye controller to QML
+    view.rootContext().setContextProperty("eyeController", eye_controller)
+
+    # Load QML file
     qml_path = Path(__file__).parent / "Eyes.qml"
     view.setSource(QUrl.fromLocalFile(str(qml_path)))
 
-    if view.status().value != 1:  # 1 = QQuickView.Status.Ready
-        errors = view.errors()
-        for err in errors:
-            print(f"QML Error: {err.toString()}")
+    if view.status().value != 1:
+        for err in view.errors():
+            logger.error(f"QML Error: {err.toString()}")
         sys.exit(1)
 
-    # Size to match round display (1080x1080)
-    view.setWidth(1080)
-    view.setHeight(1080)
+    # ─── Window Setup ───
+
     view.setResizeMode(QQuickView.ResizeMode.SizeRootObjectToView)
-    view.setColor(QColor("#000000"))  # Black background hides square corners
+    view.setColor(QColor("#000000"))
 
-    view.show()
+    if args.fullscreen:
+        view.showFullScreen()
+    else:
+        view.setWidth(1080)
+        view.setHeight(1080)
+        view.show()
 
-    # Keyboard state mapping for testing
-    # We handle this via QML's Keys since QQuickView forwards input there.
-    # But we also need a way to bridge key events. QML will call
-    # eyeController.set_state() directly on keypress.
+    logger.info("DeskBot started. Press keyboard keys to test face states.")
+    logger.info("Modules loaded: " + ", ".join(m.name for m in all_modules))
 
-    sys.exit(app.exec())
+    # ─── Run Qt Event Loop (blocks until window closes) ───
+
+    exit_code = app.exec()
+
+    # ─── Cleanup ───
+
+    logger.info("Shutting down...")
+
+    # Stop async loop
+    for task in asyncio.all_tasks(async_loop):
+        async_loop.call_soon_threadsafe(task.cancel)
+    async_loop.call_soon_threadsafe(async_loop.stop)
+    async_thread.join(timeout=3)
+
+    logger.info("DeskBot stopped.")
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":

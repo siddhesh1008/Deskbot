@@ -1,1 +1,5 @@
 /venv
+__pycache__/base_module.cpython-312.pyc
+.gitignore
+__pycache__/face_module.cpython-312.pyc
+__pycache__/event_bus.cpython-312.pyc
