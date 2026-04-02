@@ -166,7 +166,7 @@ MQTT bridge to control smart home devices. Desk light control. Room sensor monit
 - **Testable.** Each module can be tested standalone by publishing fake events. The bus test suite runs without any hardware.
 - **Incremental.** Built one module at a time, tested standalone, then integrated. No big bang deployments.
 
-## 🧊 License
+## License
 
 This project is licensed under the **MIT License**.  
 Feel free to use, modify, and expand this project — just credit the original creator.
